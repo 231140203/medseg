@@ -1,1 +1,3 @@
-# segment
+# Segment
+
+Medical image segmentation project.
