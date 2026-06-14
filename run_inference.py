@@ -63,15 +63,12 @@ def load_model_and_task():
     task_cfg['data_root'] = DATA_ROOT
     task_cfg['pickle_path'] = PICKLE_PATH
 
-    # 构建词典
-    src_dict = Dictionary()
+    # 构建词典 — 必须与训练时完全一致
+    # 训练时 vocab = 4 特殊 token (bos=0, pad=1, eos=2, unk=3) + 64×64 bin tokens = 4100
+    # BPE dict.txt 绝不能加载到 embedding 词典中！文本 tokenization 由 BERT 另行处理。
+    src_dict = Dictionary()  # 已有 bos, pad, eos, unk (4 tokens)
     tgt_dict = Dictionary()
-    # 加载 BPE 基础词典
-    bpe_dict_path = os.path.join(PROJECT_ROOT, 'utils', 'BPE', 'dict.txt')
-    if os.path.exists(bpe_dict_path):
-        src_dict = Dictionary.load(bpe_dict_path)
-        tgt_dict = Dictionary.load(bpe_dict_path)
-    # 添加 bin tokens
+    # 只添加 bin tokens，不加载 BPE
     for i in range(NUM_BINS):
         for j in range(NUM_BINS):
             src_dict.add_symbol(f"<bin_{i}_{j}>")
@@ -107,13 +104,13 @@ def load_model_and_task():
     model.load_state_dict(model_state, strict=False)
 
     model.eval()
-    device = torch.device('cpu')
-    model = model.to(device).float()  # CPU 用 fp32
+    device = torch.device('cuda')
+    model = model.to(device).float()  # fp32 on GPU for reliability
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model arch: {model_arch}")
     print(f"  Params: {n_params/1e6:.1f}M")
-    print(f"  Device: cpu (fp32)")
+    print(f"  Device: cuda (fp32)")
 
     return model, task
 
@@ -186,11 +183,9 @@ def run_inference_single_slice(model, task, img_rgb, prompt_text="segment a panc
     # 图像 Tensor: (1, 3, H, W)
     img_tensor = torch.from_numpy(img_rgb.transpose(2, 0, 1)).float().unsqueeze(0).to(device=device, dtype=dtype)
 
-    # BERT Tokenize
-    tokenizer = task.datasets['train'].tokenizer if hasattr(task, 'datasets') else None
-    if tokenizer is None:
-        from bert.tokenization_bert import BertTokenizer
-        tokenizer = BertTokenizer.from_pretrained('/root/autodl-tmp/pretrained_weights/RadBERT/')
+    # BERT Tokenize — 直接从 pretrained 路径加载，不依赖 task.datasets
+    from bert.tokenization_bert import BertTokenizer
+    tokenizer = BertTokenizer.from_pretrained('/root/autodl-tmp/pretrained_weights/RadBERT/')
 
     full_prompt = f' which region does the text " {prompt_text} " describe?'
     tokens = tokenizer(full_prompt, return_tensors='pt', padding=True, truncation=True, max_length=80)
@@ -199,14 +194,18 @@ def run_inference_single_slice(model, task, img_rgb, prompt_text="segment a panc
     att_masks = tokens['attention_mask'].to(device)
 
     # 构建 sample dict
+    patch_mask_tensor = torch.ones(1, dtype=torch.bool)
     sample = {
+        'id': np.array(['single_slice']),
         'net_input': {
             'patch_images': img_tensor,
             'src_tokens': src_tokens,
             'src_lengths': src_lengths,
             'att_masks': att_masks,
-            'patch_masks': None,
-        }
+            'patch_masks': patch_mask_tensor,
+        },
+        'label': [np.zeros((h, w), dtype=np.uint8)],  # 推理时无 GT, 只用于 shape
+        'task': ['pancreas'],  # 推理任务类型
     }
 
     # 调用 task 的推理方法
@@ -234,7 +233,7 @@ def reverse_transform(vol):
     return np.stack(out, axis=0)
 
 
-def run_inference_on_patient(model, task, img_path, lbl_path, num_slices=None):
+def run_inference_on_patient(model, task, img_path, lbl_path, num_slices=None, start_slice=0):
     """对单个病人所有切片推理，返回 pred_3d_original, gt_3d_original, header"""
     patient_id = os.path.basename(img_path).replace('.nii.gz', '')
 
@@ -254,21 +253,26 @@ def run_inference_on_patient(model, task, img_path, lbl_path, num_slices=None):
     lbl_data = np.fliplr(np.rot90(lbl_data, k=1))
     h_full, w_full, d_full = lbl_data.shape
 
-    # 限制切片数
-    if num_slices is not None:
-        z_dim = min(z_dim, num_slices)
+    # 限制切片数 — 从 start_slice 开始
+    slice_start = max(0, min(start_slice, z_dim - 1))
+    slice_end = z_dim if num_slices is None else min(z_dim, slice_start + num_slices)
+    z_indices = list(range(slice_start, slice_end))
 
-    print(f"  Total slices: {z_dim}, crop=({y_start},{x_start})")
+    print(f"  Total slices: {len(z_indices)} (z={slice_start}..{slice_end-1}), crop=({y_start},{x_start})")
 
     pred_slices = []
     gt_slices = []
+    img_slices = []  # 保存预处理后的图像用于可视化
 
-    for z in tqdm(range(z_dim), desc=f"  {patient_id}"):
+    for z in tqdm(z_indices, desc=f"  {patient_id}"):
         img_rgb = img_4d[z]
 
         # 推理
         pred_mask = run_inference_single_slice(model, task, img_rgb)
         pred_slices.append(pred_mask)
+
+        # 保存预处理图像（取灰度通道，shape (256,256)）
+        img_slices.append((img_rgb[..., 0] * 255).astype(np.uint8))
 
         # GT 裁剪
         gt_slc = lbl_data[y_start:y_start+PATCH_SIZE, x_start:x_start+PATCH_SIZE, z]
@@ -279,10 +283,12 @@ def run_inference_on_patient(model, task, img_path, lbl_path, num_slices=None):
     # Stack → 3D
     pred_3d_crop = np.stack(pred_slices, axis=0)  # (Z, 256, 256)
     gt_3d_crop = np.stack(gt_slices, axis=0)
+    img_3d_crop = np.stack(img_slices, axis=0)
 
     # 反裁剪：放回旋转+翻转后的全尺寸空间
     pred_full = np.zeros((d_full, h_full, w_full), dtype=np.uint8)
     gt_full = np.zeros((d_full, h_full, w_full), dtype=np.uint8)
+    img_full = np.zeros((d_full, h_full, w_full), dtype=np.uint8)
 
     for z in range(min(d_full, pred_3d_crop.shape[0])):
         h_avail = min(PATCH_SIZE, h_full - y_start)
@@ -291,15 +297,18 @@ def run_inference_on_patient(model, task, img_path, lbl_path, num_slices=None):
             pred_3d_crop[z, :h_avail, :w_avail]
         gt_full[z, y_start:y_start+h_avail, x_start:x_start+w_avail] = \
             gt_3d_crop[z, :h_avail, :w_avail]
+        img_full[z, y_start:y_start+h_avail, x_start:x_start+w_avail] = \
+            img_3d_crop[z, :h_avail, :w_avail]
 
     # 反向旋转
     pred_reversed = reverse_transform(pred_full)
     gt_reversed = reverse_transform(gt_full)
+    img_reversed = reverse_transform(img_full)
 
     # 转回原始方向 (X, Y, Z)
     # 原始: (X,Y,Z) → rot90+fliplr → (H,W,Z)
     # 我们需要从 (Z, H_rev, W_rev) → (X, Y, Z) 用原始header保存
-    return pred_reversed, gt_reversed, orig_header, orig_shape
+    return pred_reversed, gt_reversed, img_reversed, orig_header, orig_shape
 
 
 def compute_dice(pred, gt, class_val):
@@ -318,7 +327,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--patient', type=str, default='pancreas_001')
     parser.add_argument('--num-slices', type=int, default=None,
-                        help='限制推理切片数（None=全部）')
+                        help='最多推理的切片数（None=全部）')
+    parser.add_argument('--start-slice', type=int, default=0,
+                        help='从第几层开始推理（0-based, 默认0）')
     parser.add_argument('--output', type=str, default=OUTPUT_DIR)
     parser.add_argument('--prompt', type=str, default='segment a pancreas')
     args = parser.parse_args()
@@ -326,8 +337,8 @@ def main():
     print("=" * 60)
     print(f"  MRIpolySeg — 单病人推理")
     print(f"  Patient:  {args.patient}")
-    print(f"  Slices:   {args.num_slices or 'all'}")
-    print(f"  Device:   CPU")
+    print(f"  Slices:   {args.num_slices or 'all'} (start={args.start_slice})")
+    print(f"  Device:   CUDA (RTX 3090)")
     print(f"  Output:   {args.output}")
     print("=" * 60)
 
@@ -348,8 +359,8 @@ def main():
         return
 
     print(f"\n[2/4] Running inference on {args.patient}...")
-    pred_3d, gt_3d, header, orig_shape = run_inference_on_patient(
-        model, task, img_path, lbl_path, num_slices=args.num_slices
+    pred_3d, gt_3d, img_3d, header, orig_shape = run_inference_on_patient(
+        model, task, img_path, lbl_path, num_slices=args.num_slices, start_slice=args.start_slice
     )
 
     # 3. 保存 nii.gz
@@ -359,9 +370,11 @@ def main():
     # reverse_transform 输出 (Z, H_rev, W_rev)，我们需要 transponse 回 (X, Y, Z)
     pred_nii_data = pred_3d.transpose(2, 1, 0)  # (Z, Y, X) → (X, Y, Z)
     gt_nii_data = gt_3d.transpose(2, 1, 0)
+    img_nii_data = img_3d.transpose(2, 1, 0)
 
     pred_path = os.path.join(args.output, f"{args.patient}_pred.nii.gz")
     gt_path = os.path.join(args.output, f"{args.patient}_gt.nii.gz")
+    img_path_out = os.path.join(args.output, f"{args.patient}_img.nii.gz")
 
     pred_nii = nib.Nifti1Image(pred_nii_data.astype(np.float32), None, header)
     nib.save(pred_nii, pred_path)
@@ -370,6 +383,10 @@ def main():
     gt_nii = nib.Nifti1Image(gt_nii_data.astype(np.float32), None, header)
     nib.save(gt_nii, gt_path)
     print(f"  Saved: {gt_path}  shape={gt_nii_data.shape}")
+
+    img_nii = nib.Nifti1Image(img_nii_data.astype(np.uint8), None, header)
+    nib.save(img_nii, img_path_out)
+    print(f"  Saved: {img_path_out}  shape={img_nii_data.shape}")
 
     # 4. Dice 评估
     print(f"\n[4/4] Evaluation")

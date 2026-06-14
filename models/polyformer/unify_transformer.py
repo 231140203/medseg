@@ -1333,7 +1333,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
         if self.layernorm_embedding is not None:
             if code_masks is None or not code_masks.any() or not getattr(self, "code_layernorm_embedding", False):
-                x = self.layernorm_embedding(x.half())
+                x = self.layernorm_embedding(x)
             elif code_masks is not None and code_masks.all():
                 x = self.code_layernorm_embedding(x)
             else:
