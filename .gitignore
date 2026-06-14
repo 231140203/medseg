@@ -1,0 +1,25 @@
+# Git 忽略规则 — MRIpolySeg
+# 保持仓库 <100MB
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.ipynb_checkpoints/
+
+# 推理输出（太大，本地保存即可）
+Results/
+
+# 大文件 & 数据
+refer/
+fairseq/docs/fairseq.gif
+Preprocess/*.png
+Preprocess/*.jpg
+
+# 训练日志
+Results/*.log
+
+# IDE & 本地配置
+.claude/
+.vscode/
+.idea/
